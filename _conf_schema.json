@@ -1,0 +1,12 @@
+{
+  "skip_llm_when_muted": {
+    "type": "bool",
+    "description": "禁言期间,来自被禁言群的消息不再触发默认 AI 回复(避免生成一条发不出去的回复、浪费额度)。仅影响默认 AI 链路,不影响其他插件。",
+    "default": true
+  },
+  "log_blocked_sends": {
+    "type": "bool",
+    "description": "拦截到发往被禁言群的消息时是否在日志中记录(排查风控与调试用)。",
+    "default": true
+  }
+}

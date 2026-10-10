@@ -8,11 +8,14 @@
 2. 全员禁言(user_id=0)-> 拦截;机器人是管理员时 -> 不拦截;
 3. 解禁 / 解除全员禁言 -> 恢复发送;
 4. 禁言时长到期 -> 自动恢复(发送时即时放行,不等后台循环);
-5. 状态持久化(含 v1.0 旧格式兼容),重启后可恢复,过期条目加载即清理;
-6. 管理命令(手动闭嘴 / 状态 / 解除);
+5. 状态持久化(含 v1.0/v1.1 旧格式兼容),重启后可恢复,过期条目加载即清理;
+6. 管理命令(手动闭嘴 / 状态 / 自检 / 解除);
 7. 禁言期间来自该群的消息不再触发默认 AI 回复;
-8. 卸载补丁后发送恢复正常;
-9. 边界情况(群号是数字、时长是字符串/浮点、多次禁言、个人+全员叠加等)。
+8. 多账号隔离:同群里别的机器人账号被禁言,不该连累当前账号;
+9. 自检纠偏:协议端说已经不在禁言中就清掉拦截;还在禁言中则校准时长;
+   查询失败 / 字段缺失 / 手动闭嘴 等情况一律保持现状;
+10. 卸载补丁后发送恢复正常;
+11. 边界情况(群号是数字、时长是字符串/浮点、多次禁言、个人+全员叠加等)。
 
 运行: python tests/test_plugin.py
 """
@@ -29,6 +32,9 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # 假 AstrBot API(必须在 import main 之前安装)
 # ---------------------------------------------------------------------------
+
+# 让假的 StarTools.get_data_dir() 返回当前测试用的临时目录
+_CURRENT_DATA_DIR: dict = {"path": None}
 
 
 def _install_fake_astrbot():
@@ -106,9 +112,23 @@ def _install_fake_astrbot():
             self.context = context
             self.config = config or {}
 
+    class PlatformManager:
+        def __init__(self):
+            self.platform_insts = []
+
     class Context:
         def __init__(self):
-            self.platform_manager = types.SimpleNamespace(platform_insts=[])
+            self.platform_manager = PlatformManager()
+
+    class StarTools:
+        @staticmethod
+        def get_data_dir(name=None):
+            p = _CURRENT_DATA_DIR["path"]
+            if p is None:
+                raise RuntimeError("测试未设置数据目录")
+            p = Path(p)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
 
     class AstrMessageEvent:
         """假的 AstrMessageEvent:镜像真实 AstrBot 的 call_llm 语义。"""
@@ -119,7 +139,7 @@ def _install_fake_astrbot():
             )
             self.message_str = message_str
             self.bot = bot
-            # 真实 AstrBot:call_llm 默认 False 表示"走默认 LLM 链路"
+            # 真实 AstrBot:call_llm=True 表示"禁止默认 LLM 请求",默认 False
             self.call_llm = False
             self._results = []
 
@@ -137,14 +157,16 @@ def _install_fake_astrbot():
             self._results.append(r)
             return r
 
+    # 顶层包也要注册:否则 `import astrbot.api.star` 这类带点名的导入
+    # 会因为找不到父包 astrbot 而报 ModuleNotFoundError
+    _mk("astrbot")
     api = _mk("astrbot.api", logger=_Logger(), AstrBotConfig=AstrBotConfig)
     _mk(
         "astrbot.api.event",
         AstrMessageEvent=AstrMessageEvent,
         filter=_Filter(),
     )
-    # 注意:故意不提供 StarTools,验证插件会退回插件目录存状态
-    _mk("astrbot.api.star", Context=Context, Star=Star)
+    _mk("astrbot.api.star", Context=Context, Star=Star, StarTools=StarTools)
 
     class FakeAiocqhttpMessageEvent:
         """模拟 aiocqhttp 事件类,记录每次真实发送。"""
@@ -171,14 +193,49 @@ def _install_fake_astrbot():
         "astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event",
         AiocqhttpMessageEvent=FakeAiocqhttpMessageEvent,
     )
-    return AstrBotConfig, FakeAiocqhttpMessageEvent, AstrMessageEvent, Context
+    return (
+        AstrBotConfig,
+        FakeAiocqhttpMessageEvent,
+        AstrMessageEvent,
+        Context,
+        PlatformManager,
+    )
 
 
-AstrBotConfig, FakeAiocqhttpMessageEvent, FakeEvent, FakeContext = _install_fake_astrbot()
+(
+    AstrBotConfig,
+    FakeAiocqhttpMessageEvent,
+    FakeEvent,
+    FakeContext,
+    FakePlatformManager,
+) = _install_fake_astrbot()
 
 # 导入插件主模块(此时 astrbot.* 均为假模块)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import main  # noqa: E402
 from main import ShutUpWhenMuted  # noqa: E402
+
+_PATCH_ATTRS = (
+    "_shutup_send_patched",
+    "_shutup_muted_groups",
+    "_shutup_orig_send_message",
+    "_shutup_log_blocked",
+    "_shutup_blocked_count",
+    "_shutup_expire_hook",
+)
+
+
+def _clear_patch():
+    """把上一次测试可能残留的补丁清理干净。"""
+    if getattr(FakeAiocqhttpMessageEvent, "_shutup_send_patched", False):
+        orig = getattr(FakeAiocqhttpMessageEvent, "_shutup_orig_send_message", None)
+        if orig is not None:
+            FakeAiocqhttpMessageEvent.send_message = classmethod(orig)
+        for attr in _PATCH_ATTRS:
+            try:
+                delattr(FakeAiocqhttpMessageEvent, attr)
+            except AttributeError:
+                pass
 
 
 def _ban_notice(group_id, user_id, self_id, duration=60, sub_type="ban"):
@@ -195,11 +252,22 @@ def _ban_notice(group_id, user_id, self_id, duration=60, sub_type="ban"):
 
 
 class FakeBot:
-    """模拟 aiocqhttp 的 CQHttp,可指定 get_group_member_info 的返回。"""
+    """模拟 aiocqhttp 的 CQHttp。
 
-    def __init__(self, role=None, raise_error=False):
+    get_group_member_info 的返回可通过参数控制,用于自检纠偏的测试。
+    """
+
+    def __init__(
+        self,
+        role=None,
+        shut_up_timestamp=0,
+        raise_error=False,
+        omit_ts=False,
+    ):
         self.role = role
+        self.shut_up_timestamp = shut_up_timestamp
         self.raise_error = raise_error
+        self.omit_ts = omit_ts
         self.calls = []
 
     async def call_action(self, action, **kwargs):
@@ -207,39 +275,57 @@ class FakeBot:
         if self.raise_error:
             raise RuntimeError("api failed")
         if action == "get_group_member_info":
-            return {"role": self.role, "user_id": kwargs.get("user_id")}
+            info = {"role": self.role, "user_id": kwargs.get("user_id")}
+            if not self.omit_ts:
+                info["shut_up_timestamp"] = self.shut_up_timestamp
+            return info
         return {}
 
 
-class _PluginHarness:
-    """构建一个插件实例,并把状态文件指到临时目录,不污染插件目录。"""
+class FakePlatform:
+    """模拟一个平台实例(有 meta() 和 bot 属性)。"""
 
-    def __init__(self, config=None):
-        tmp = tempfile.mkdtemp(prefix="shutup_test_")
-        self.state_file = Path(tmp) / "muted_groups.json"
+    def __init__(self, name="aiocqhttp", bot=None):
+        self._name = name
+        self.bot = bot
+
+    def meta(self):
+        return types.SimpleNamespace(name=self._name)
+
+
+class _PluginHarness:
+    """构建一个插件实例,状态文件落在临时数据目录,不污染插件目录。"""
+
+    created: list = []
+
+    def __init__(self, config=None, data_dir=None):
+        self.data_dir = (
+            Path(data_dir)
+            if data_dir
+            else Path(tempfile.mkdtemp(prefix="shutup_test_"))
+        )
+        _CURRENT_DATA_DIR["path"] = self.data_dir
         self.plugin = ShutUpWhenMuted(FakeContext(), AstrBotConfig(config or {}))
-        self.plugin._state_file = self.state_file
+        self.state_file = self.plugin._state_file
+        _PluginHarness.created.append(self.plugin)
 
 
 class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         FakeAiocqhttpMessageEvent.sent = []
-        # 清理上一个测试可能残留的补丁与类属性
-        if hasattr(FakeAiocqhttpMessageEvent, "_shutup_send_patched"):
-            orig = getattr(FakeAiocqhttpMessageEvent, "_shutup_orig_send_message", None)
-            if orig is not None:
-                FakeAiocqhttpMessageEvent.send_message = classmethod(orig)
-            for attr in (
-                "_shutup_send_patched",
-                "_shutup_muted_groups",
-                "_shutup_orig_send_message",
-                "_shutup_log_blocked",
-                "_shutup_blocked_count",
-            ):
+        _PluginHarness.created = []
+        _clear_patch()
+
+    async def asyncTearDown(self):
+        for plugin in _PluginHarness.created:
+            task = plugin._expire_task
+            if task is not None and not task.done():
+                task.cancel()
                 try:
-                    delattr(FakeAiocqhttpMessageEvent, attr)
-                except AttributeError:
+                    await task
+                except (asyncio.CancelledError, Exception):
                     pass
+        _clear_patch()
 
     async def _install(self, config=None):
         h = _PluginHarness(config)
@@ -251,9 +337,13 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         ev = FakeEvent(group_id=group_id, raw=raw, bot=bot)
         await plugin.on_group_ban_notice(ev)
 
-    async def _send(self, is_group=True, session_id="111"):
+    async def _send(self, is_group=True, session_id="111", event=None):
         await FakeAiocqhttpMessageEvent.send_message(
-            bot=None, message_chain=object(), is_group=is_group, session_id=session_id
+            bot=None,
+            message_chain=object(),
+            event=event,
+            is_group=is_group,
+            session_id=session_id,
         )
 
     # ------------------------------------------------------- 自己被禁言
@@ -327,14 +417,25 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
         self.assertNotIn("111", h.plugin.muted)
 
+    async def test_send_path_expiry_is_persisted(self):
+        # 发送路径上发现过期时,要走 _expire_once(会落盘),而不是只改内存
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
+        h.plugin.muted["111"]["until"] = time.time() - 1
+        h.plugin._save_state()
+        await self._send(session_id="111")
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
+        on_disk = json.loads(h.state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("111", on_disk)
+
     # ------------------------------------------------------- 全员禁言
     async def test_whole_group_ban_blocks_send(self):
         h = await self._install()
         # 全员禁言:user_id = 0,没有 bot 可查身份 -> 按普通成员处理,拦截
         await self._notice(h.plugin, _ban_notice("111", "0", "999", duration=-1))
-        self.assertEqual(
-            h.plugin.muted.get("111"), {"until": None, "whole": True}
-        )
+        info = h.plugin.muted["111"]
+        self.assertTrue(info["whole"])
+        self.assertIsNone(info["until"])
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
         # 禁言期间的群消息也不触发默认 LLM
@@ -374,7 +475,9 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
     async def test_whole_group_ban_member_bot_blocked(self):
         h = await self._install()
         await self._notice(
-            h.plugin, _ban_notice("111", "0", "999", duration=-1), bot=FakeBot(role="member")
+            h.plugin,
+            _ban_notice("111", "0", "999", duration=-1),
+            bot=FakeBot(role="member"),
         )
         self.assertIn("111", h.plugin.muted)
         await self._send(session_id="111")
@@ -404,7 +507,8 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         await self._notice(
             h.plugin, _ban_notice("111", "999", "999", duration=0, sub_type="lift_ban")
         )
-        self.assertEqual(h.plugin.muted["111"], {"until": None, "whole": True})
+        self.assertTrue(h.plugin.muted["111"]["whole"])
+        self.assertIsNone(h.plugin.muted["111"]["until"])
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
         # 解除全员禁言:彻底恢复
@@ -423,9 +527,158 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         h.plugin.muted["111"]["until"] = time.time() - 1
         expired = h.plugin._expire_once()
         self.assertEqual(expired, [])
-        self.assertEqual(h.plugin.muted["111"], {"until": None, "whole": True})
+        self.assertTrue(h.plugin.muted["111"]["whole"])
+        self.assertIsNone(h.plugin.muted["111"]["until"])
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
+
+    # ------------------------------------------------------- 多账号隔离
+    async def test_other_bot_account_not_blocked(self):
+        # 群 111 里被禁言的是 999,但现在是 888 这个账号在发言 -> 放行
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
+        await self._send(session_id="111", event={"self_id": 888})
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
+
+    async def test_own_account_still_blocked(self):
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
+        await self._send(session_id="111", event={"self_id": 999})
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
+        self.assertEqual(h.plugin.blocked_count.get("111"), 1)
+
+    async def test_unknown_sender_account_blocks_conservatively(self):
+        # 主动推送(event=None)判断不了是哪个账号 -> 保守拦截
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
+        await self._send(session_id="111", event=None)
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
+
+    async def test_llm_suppression_respects_multi_account(self):
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
+        # 别的账号收到该群消息:不该被压制
+        ev_other = FakeEvent(group_id="111", self_id="888")
+        await h.plugin.on_group_message(ev_other)
+        self.assertFalse(ev_other.call_llm)
+        # 被禁言的账号收到该群消息:压制
+        ev_own = FakeEvent(group_id="111", self_id="999")
+        await h.plugin.on_group_message(ev_own)
+        self.assertTrue(ev_own.call_llm)
+
+    # ------------------------------------------------------- 自检纠偏
+    async def test_selfcheck_clears_stale_entry(self):
+        # 时长未知 + 错过解禁通知 -> 自检发现协议端说没在禁言,清掉
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=0))
+        self.assertIn("111", h.plugin.muted)
+        bot = FakeBot(shut_up_timestamp=0)
+        h.plugin._bots["111"] = bot
+        changed = await h.plugin._self_check()
+        self.assertEqual(changed, ["111"])
+        self.assertNotIn("111", h.plugin.muted)
+        await self._send(session_id="111")
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
+
+    async def test_selfcheck_calibrates_until(self):
+        # 协议端说还在禁言(直到 future)-> 校准截止时间,继续拦
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=0))
+        future = time.time() + 300
+        h.plugin._bots["111"] = FakeBot(shut_up_timestamp=future)
+        changed = await h.plugin._self_check()
+        self.assertEqual(changed, ["111"])
+        self.assertAlmostEqual(h.plugin.muted["111"]["until"], future, places=3)
+        await self._send(session_id="111")
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
+
+    async def test_selfcheck_no_change_when_until_already_correct(self):
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=300))
+        until = h.plugin.muted["111"]["until"]
+        h.plugin._bots["111"] = FakeBot(shut_up_timestamp=int(until))
+        changed = await h.plugin._self_check()
+        self.assertEqual(changed, [])
+
+    async def test_selfcheck_skips_when_field_missing(self):
+        # 协议端没返回 shut_up_timestamp -> 不做判断,保持拦截
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=0))
+        h.plugin._bots["111"] = FakeBot(omit_ts=True)
+        changed = await h.plugin._self_check()
+        self.assertEqual(changed, [])
+        self.assertIn("111", h.plugin.muted)
+
+    async def test_selfcheck_skips_on_api_error(self):
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=0))
+        h.plugin._bots["111"] = FakeBot(raise_error=True)
+        changed = await h.plugin._self_check()
+        self.assertEqual(changed, [])
+        self.assertIn("111", h.plugin.muted)
+
+    async def test_selfcheck_clears_whole_when_bot_is_admin(self):
+        # 全员禁言 + 机器人是管理员 -> 其实能发言,撤销拦截
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "0", "999", duration=-1))
+        self.assertTrue(h.plugin.muted["111"]["whole"])
+        h.plugin._bots["111"] = FakeBot(role="owner", shut_up_timestamp=0)
+        changed = await h.plugin._self_check()
+        self.assertEqual(changed, ["111"])
+        self.assertNotIn("111", h.plugin.muted)
+
+    async def test_selfcheck_keeps_manual_mute(self):
+        # 手动 /闭嘴 的群,即使协议端说没在禁言,也要保持闭嘴
+        h = await self._install()
+        async for _ in h.plugin.mute_cmd(FakeEvent(self_id="999"), "111"):
+            pass
+        h.plugin._bots["111"] = FakeBot(shut_up_timestamp=0)
+        changed = await h.plugin._self_check()
+        self.assertEqual(changed, [])
+        self.assertIn("111", h.plugin.muted)
+        self.assertTrue(h.plugin.muted["111"]["manual"])
+        await self._send(session_id="111")
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
+
+    async def test_selfcheck_without_bot_is_noop(self):
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=0))
+        h.plugin._bots.clear()
+        # 平台实例为空 -> 拿不到客户端,跳过自检
+        changed = await h.plugin._self_check()
+        self.assertEqual(changed, [])
+        self.assertIn("111", h.plugin.muted)
+
+    async def test_bot_for_ambiguous_multi_platform(self):
+        # 有多个 aiocqhttp 平台实例且没记录过 -> 无法确定,返回 None
+        h = await self._install()
+        b1, b2 = FakeBot(), FakeBot()
+        h.plugin.context.platform_manager.platform_insts = [
+            FakePlatform("aiocqhttp", b1),
+            FakePlatform("aiocqhttp", b2),
+        ]
+        self.assertIsNone(h.plugin._bot_for("111"))
+        # 只有一个实例 -> 用它
+        h.plugin.context.platform_manager.platform_insts = [
+            FakePlatform("aiocqhttp", b1),
+            FakePlatform("telegram", b2),
+        ]
+        self.assertIs(h.plugin._bot_for("111"), b1)
+        # 通知里记过这个群 -> 优先用记录的那个
+        h.plugin._bots["111"] = b2
+        self.assertIs(h.plugin._bot_for("111"), b2)
+
+    async def test_selfcheck_command(self):
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=0))
+        h.plugin._bots["111"] = FakeBot(shut_up_timestamp=0)
+        results = []
+        async for r in h.plugin.selfcheck_cmd(FakeEvent()):
+            results.append(r)
+        self.assertEqual(len(results), 1)
+        self.assertIn("自检完成", results[0].text)
+        self.assertIn("修正了 1 个群", results[0].text)
+        self.assertNotIn("111", h.plugin.muted)
 
     # ------------------------------------------------------- 持久化
     async def test_persistence_across_restart(self):
@@ -434,10 +687,8 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(h.state_file.exists())
 
         # 模拟重启:新实例读取同一状态文件
-        h2 = _PluginHarness()
-        h2.plugin._state_file = h.state_file
-        h2.plugin._load_state()
-        self.assertEqual(h2.plugin.muted, {"111": h.plugin.muted["111"]})
+        h2 = _PluginHarness(data_dir=h.data_dir)
+        self.assertEqual(h2.plugin.muted, h.plugin.muted)
 
     async def test_load_old_flat_format(self):
         # v1.0 的状态文件是 {群号: 时间戳或 null}
@@ -446,23 +697,37 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         h.state_file.write_text(json.dumps(old), encoding="utf-8")
         h.plugin._load_state()
         # 333 已过期,加载即清理
-        self.assertEqual(
-            h.plugin.muted,
-            {
-                "111": {"until": old["111"], "whole": False},
-                "222": {"until": None, "whole": False},
-            },
-        )
+        self.assertEqual(set(h.plugin.muted), {"111", "222"})
+        self.assertAlmostEqual(h.plugin.muted["111"]["until"], old["111"], places=3)
+        self.assertIsNone(h.plugin.muted["222"]["until"])
+        self.assertFalse(h.plugin.muted["222"]["whole"])
 
     async def test_load_new_format(self):
         h = _PluginHarness()
         data = {
-            "111": {"until": time.time() + 3600, "whole": False},
-            "222": {"until": None, "whole": True},
+            "111": {
+                "until": time.time() + 3600,
+                "whole": False,
+                "self_id": "999",
+                "manual": False,
+            },
+            "222": {"until": None, "whole": True, "self_id": "999", "manual": False},
         }
         h.state_file.write_text(json.dumps(data), encoding="utf-8")
         h.plugin._load_state()
-        self.assertEqual(h.plugin.muted, data)
+        self.assertEqual(set(h.plugin.muted), {"111", "222"})
+        self.assertEqual(h.plugin.muted["111"]["self_id"], "999")
+        self.assertTrue(h.plugin.muted["222"]["whole"])
+
+    async def test_load_tolerates_v11_format(self):
+        # v1.1 的文件没有 self_id / manual 字段,读取时补默认值
+        h = _PluginHarness()
+        data = {"111": {"until": time.time() + 3600, "whole": False}}
+        h.state_file.write_text(json.dumps(data), encoding="utf-8")
+        h.plugin._load_state()
+        info = h.plugin.muted["111"]
+        self.assertIsNone(info["self_id"])
+        self.assertFalse(info["manual"])
 
     async def test_load_purges_expired_entry(self):
         h = await self._install()
@@ -470,10 +735,38 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         # 停机期间禁言早已到期:重启后不应继续拦截
         h.plugin.muted["111"]["until"] = time.time() - 100
         h.plugin._save_state()
-        h2 = _PluginHarness()
-        h2.plugin._state_file = h.state_file
-        h2.plugin._load_state()
+        h2 = _PluginHarness(data_dir=h.data_dir)
         self.assertNotIn("111", h2.plugin.muted)
+
+    async def test_load_keeps_manual_entry_past_until(self):
+        # 手动闭嘴的条目不会因为 until 过期被清掉
+        h = _PluginHarness()
+        data = {
+            "111": {
+                "until": time.time() - 100,
+                "whole": False,
+                "self_id": "999",
+                "manual": True,
+            }
+        }
+        h.state_file.write_text(json.dumps(data), encoding="utf-8")
+        h.plugin._load_state()
+        self.assertIn("111", h.plugin.muted)
+
+    async def test_state_file_falls_back_without_startools(self):
+        # 老版本 AstrBot 没有 StarTools -> 退回插件目录
+        import astrbot.api.star as star_mod
+
+        saved = star_mod.StarTools
+        del star_mod.StarTools
+        try:
+            plugin = ShutUpWhenMuted(FakeContext(), AstrBotConfig({}))
+            self.assertEqual(
+                plugin._state_file.parent,
+                Path(main.__file__).resolve().parent,
+            )
+        finally:
+            star_mod.StarTools = saved
 
     # ------------------------------------------------------- 管理命令
     async def test_status_and_unmute_commands(self):
@@ -503,6 +796,15 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
             results.append(r)
         self.assertIn("不在禁言拦截列表", results[0].text)
 
+    async def test_status_shows_manual(self):
+        h = await self._install()
+        async for _ in h.plugin.mute_cmd(FakeEvent(), "111"):
+            pass
+        results = []
+        async for r in h.plugin.status_cmd(FakeEvent()):
+            results.append(r)
+        self.assertIn("手动闭嘴中", results[0].text)
+
     async def test_unmute_without_group_id_uses_current_group(self):
         h = await self._install()
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=3600))
@@ -518,7 +820,8 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         async for r in h.plugin.mute_cmd(FakeEvent(), "111"):
             results.append(r)
         self.assertIn("已手动闭嘴", results[0].text)
-        self.assertEqual(h.plugin.muted["111"], {"until": None, "whole": False})
+        self.assertTrue(h.plugin.muted["111"]["manual"])
+        self.assertIsNone(h.plugin.muted["111"]["until"])
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
         # 手动闭嘴的群,消息也不触发默认 LLM
@@ -541,11 +844,41 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已手动闭嘴", results[0].text)
         self.assertIn("111", h.plugin.muted)
 
+    async def test_manual_mute_survives_lift_notice(self):
+        # 手动 /闭嘴 的群,收到解禁通知也不该自动恢复(等 /闭嘴解除)
+        h = await self._install()
+        async for _ in h.plugin.mute_cmd(FakeEvent(self_id="999"), "111"):
+            pass
+        await self._notice(
+            h.plugin, _ban_notice("111", "999", "999", duration=0, sub_type="lift_ban")
+        )
+        self.assertIn("111", h.plugin.muted)
+        await self._send(session_id="111")
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
+
+    async def test_expire_keeps_manual_mute(self):
+        # 手动闭嘴的条目即使被写了 until,到期也不自动恢复
+        h = await self._install()
+        async for _ in h.plugin.mute_cmd(FakeEvent(), "111"):
+            pass
+        h.plugin.muted["111"]["until"] = time.time() - 1
+        expired = h.plugin._expire_once()
+        self.assertEqual(expired, [])
+        self.assertIn("111", h.plugin.muted)
+
+    async def test_missing_group_id_hint(self):
+        h = await self._install()
+        for coro in (h.plugin.mute_cmd(FakeEvent()), h.plugin.unmute_cmd(FakeEvent())):
+            results = []
+            async for r in coro:
+                results.append(r)
+            self.assertIn("请指定群号", results[0].text)
+
     # ------------------------------------------------------- LLM 抑制
     async def test_group_message_suppresses_llm_when_muted(self):
         h = await self._install()
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
-        ev = FakeEvent(group_id="111")
+        ev = FakeEvent(group_id="111", self_id="999")
         await h.plugin.on_group_message(ev)
         # call_llm=True 表示阻止默认 LLM 链路(镜像真实 AstrBot 语义)
         self.assertTrue(ev.call_llm)
@@ -629,6 +962,16 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         ):
             await self._notice(h.plugin, raw)
         self.assertNotIn("111", h.plugin.muted)
+
+    async def test_notice_without_self_id_uses_event_self_id(self):
+        # 通知里没带 self_id 时,退回用 event.get_self_id()
+        h = await self._install()
+        raw = _ban_notice("111", "999", "999", duration=60)
+        raw.pop("self_id")
+        ev = FakeEvent(group_id="111", self_id="999", raw=raw)
+        await h.plugin.on_group_ban_notice(ev)
+        self.assertIn("111", h.plugin.muted)
+        self.assertEqual(h.plugin.muted["111"]["self_id"], "999")
 
     async def test_fmt_remaining(self):
         f = ShutUpWhenMuted._fmt_remaining

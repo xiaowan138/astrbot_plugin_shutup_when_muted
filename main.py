@@ -86,6 +86,11 @@ except Exception:  # pragma: no cover - 兼容旧版 AstrBot 的导入路径
 
 _PLUGIN_NAME = "astrbot_plugin_shutup_when_muted"
 
+# 状态文件里表示"不知道是哪个机器人账号"的占位账号。
+# v1.0 / v1.1 的旧状态只记了群、没记账号,迁移过来时用这个占位,
+# 表示"查不出是谁被禁言了",按保守处理(哪个账号都拦)。
+_ANY_ACCOUNT = "*"
+
 
 def _outline(chain: Any) -> str:
     """从要发送的消息里提取一小段文字,用于写日志(最多 60 字)。
@@ -113,10 +118,11 @@ class ShutUpWhenMuted(Star):
 
         # 禁言名单:{ 群号(str): 条目 }
         # 条目字段:
-        #   until  -> 禁言截止时间戳;None 表示"时长未知",只等解禁通知或手动解除
-        #   whole  -> 是否因为"群开了全员禁言"而闭嘴(没有时长概念,等解除通知)
-        #   self_id-> 被禁言的是哪个机器人账号(多账号隔离用)
-        #   manual -> 是否是管理员用 /闭嘴 手动闭嘴的(不会被解禁通知或自检清掉)
+        #   whole       -> 群是否开着全员禁言(没有时长概念,等解除通知)
+        #   whole_owner -> 记录"开启全员禁言"的通知来自哪个机器人账号(自检查身份用)
+        #   manual      -> 是否是管理员用 /闭嘴 手动闭嘴的(整群闭嘴,不会被自动清掉)
+        #   accounts    -> { 机器人账号: 禁言截止时间戳 };None 表示时长未知。
+        #                  同一个群里多个账号各记各的,互不覆盖
         self.muted: dict[str, dict] = {}
 
         # 本次运行以来每个群被拦下的消息条数(仅内存,重启清零)
@@ -180,21 +186,31 @@ class ShutUpWhenMuted(Star):
 
     @staticmethod
     def _entry(
-        until: float | None = None,
         whole: bool = False,
-        self_id: str | None = None,
         manual: bool = False,
+        accounts: dict[str, float | None] | None = None,
+        whole_owner: str | None = None,
     ) -> dict:
         """构造一个禁言条目。"""
         return {
-            "until": until,
             "whole": whole,
-            "self_id": self_id,
+            "whole_owner": whole_owner,
             "manual": manual,
+            "accounts": dict(accounts or {}),
         }
 
+    @staticmethod
+    def _norm_until(value: Any) -> float | None:
+        """把状态文件里的截止时间统一成 float 或 None。"""
+        return float(value) if isinstance(value, (int, float)) else None
+
     def _load_state(self) -> None:
-        """从文件读取禁言名单(兼容 v1.0 / v1.1 的旧格式),并清理已过期的条目。"""
+        """从文件读取禁言名单,兼容 v1.0 / v1.1 / v1.2 的旧格式。
+
+        旧格式一个群只有一个槽位,读进来后统一升级成 accounts 映射;
+        旧条目如果没记 self_id,用 _ANY_ACCOUNT 占位(查不出是哪个账号,
+        按保守处理)。
+        """
         try:
             if not self._state_file.exists():
                 return
@@ -203,37 +219,51 @@ class ShutUpWhenMuted(Star):
                 return
             loaded: dict[str, dict] = {}
             for k, v in data.items():
-                # 新格式(字典)
-                if isinstance(v, dict):
-                    until = v.get("until")
-                    raw_self = v.get("self_id")
-                    loaded[str(k)] = self._entry(
-                        until=float(until)
-                        if isinstance(until, (int, float))
-                        else None,
+                gid = str(k)
+                # 新格式(v1.3.0):带 accounts 映射,一个群可以记多个账号
+                if isinstance(v, dict) and isinstance(v.get("accounts"), dict):
+                    accounts = {
+                        str(acc): self._norm_until(until)
+                        for acc, until in v["accounts"].items()
+                    }
+                    owner = v.get("whole_owner")
+                    loaded[gid] = self._entry(
                         whole=bool(v.get("whole")),
-                        self_id=str(raw_self) if raw_self is not None else None,
                         manual=bool(v.get("manual")),
+                        accounts=accounts,
+                        whole_owner=str(owner) if owner is not None else None,
+                    )
+                # v1.1 / v1.2 的旧格式:一个群一个槽位(until + self_id)
+                elif isinstance(v, dict):
+                    raw_self = v.get("self_id")
+                    account = str(raw_self) if raw_self is not None else _ANY_ACCOUNT
+                    loaded[gid] = self._entry(
+                        whole=bool(v.get("whole")),
+                        manual=bool(v.get("manual")),
+                        accounts={account: self._norm_until(v.get("until"))},
+                        whole_owner=str(raw_self) if raw_self is not None else None,
                     )
                 # v1.0 的旧格式:纯时间戳或 null
                 elif isinstance(v, (int, float)):
-                    loaded[str(k)] = self._entry(until=float(v))
+                    loaded[gid] = self._entry(accounts={_ANY_ACCOUNT: float(v)})
                 elif v is None:
-                    loaded[str(k)] = self._entry()
+                    loaded[gid] = self._entry(accounts={_ANY_ACCOUNT: None})
+
             # 禁言早就到期的(比如停机期间走完),不用再拦
             now = time.time()
-            expired = [
-                gid
-                for gid, info in loaded.items()
-                if not info["whole"]
-                and not info["manual"]
-                and info["until"] is not None
-                and now >= info["until"]
-            ]
-            for gid in expired:
-                loaded.pop(gid, None)
+            purged = False
+            for gid, info in list(loaded.items()):
+                if info["whole"] or info["manual"]:
+                    continue
+                accounts = info["accounts"]
+                for acc, until in list(accounts.items()):
+                    if until is not None and now >= until:
+                        accounts.pop(acc, None)
+                        purged = True
+                if not accounts:
+                    loaded.pop(gid, None)
             self.muted = loaded
-            if expired:
+            if purged:
                 self._save_state()
             if self.muted:
                 logger.info(
@@ -245,26 +275,48 @@ class ShutUpWhenMuted(Star):
 
     # ------------------------------------------------------------ 名单操作
     def _is_blocked(self, gid: str, self_id: str | None = None) -> bool:
-        """判断一个群当前是否处于拦截状态(顺带清理已过期的条目)。
+        """判断一个群当前是否处于拦截状态(顺带清理已过期的禁言)。
 
-        self_id 是"正在发言的这个机器人账号",用于多账号隔离:同一个群里
-        被禁言的是别的机器人账号时,当前账号不该被连累。
+        self_id 是"正在发言的这个机器人账号":个人禁言按账号隔离,同一个群里
+        被禁言的是别的机器人账号时,当前账号不该被连累;全员禁言和手动闭嘴
+        是"整群闭嘴",对所有账号生效。
         """
         info = self.muted.get(gid)
         if info is None:
             return False
-        # 多账号:被禁言的账号和当前发言的账号不是同一个 -> 放行
-        owner = info.get("self_id")
-        if owner and self_id and str(owner) != str(self_id):
+        # 全员禁言 / 手动闭嘴:整群生效,不看是哪个账号在发言
+        if info.get("whole") or info.get("manual"):
+            return True
+        accounts = info.get("accounts") or {}
+        if not accounts:
             return False
-        if not info.get("whole"):
-            until = info.get("until")
-            if until is not None and time.time() >= until:
-                # 已到期,立即放行并清理,不用等后台循环
-                self.muted.pop(gid, None)
-                self.blocked_count.pop(gid, None)
-                return False
-        return True
+        # 先把已经到期的账号清掉(发送时即时校验,不用等后台循环)。
+        # 必须整体清完再判断,否则"所有账号都已到期"时会被下面的
+        # "账号未知就保守拦截"误拦。
+        now = time.time()
+        purged = False
+        for acc, until in list(accounts.items()):
+            if until is not None and now >= until:
+                accounts.pop(acc, None)
+                purged = True
+        if purged:
+            self._drop_if_empty(gid, info)
+            self._save_state()
+        accounts = info.get("accounts") or {}
+        if not accounts:
+            return False
+        if not self_id:
+            # 还有活跃的禁言、但判断不出发言的是哪个账号(主动推送):保守拦截
+            return True
+        # 被禁言的是别的机器人账号时,不连累当前账号
+        account = _ANY_ACCOUNT if _ANY_ACCOUNT in accounts else str(self_id)
+        return account in accounts
+
+    def _drop_if_empty(self, gid: str, info: dict) -> None:
+        """条目里既没有禁言账号、也没有全员禁言/手动闭嘴时,整条清掉。"""
+        if not info.get("whole") and not info.get("manual") and not info.get("accounts"):
+            self.muted.pop(gid, None)
+            self.blocked_count.pop(gid, None)
 
     def _mute_self(
         self,
@@ -273,54 +325,78 @@ class ShutUpWhenMuted(Star):
         self_id: str | None = None,
         manual: bool = False,
     ) -> None:
-        """机器人自己被禁言:记录截止时间(until 为 None 表示时长未知)。"""
+        """让机器人对某个群闭嘴。
+
+        - 被群禁言(manual=False):按账号记录截止时间(None 表示时长未知);
+        - 管理员手动闭嘴(manual=True):整群生效,不受账号限制,也不自动恢复。
+        """
         info = self.muted.get(gid)
         if info is None:
-            self.muted[gid] = self._entry(until, False, self_id, manual)
+            info = self._entry()
+            self.muted[gid] = info
+        if manual:
+            info["manual"] = True
         else:
-            info["until"] = until
-            # 手动闭嘴是"管理员说了算",后续的禁言通知不该把它降级成自动拦截
-            info["manual"] = manual or bool(info.get("manual"))
-            if self_id:
-                info["self_id"] = self_id
+            info["accounts"][str(self_id) if self_id else _ANY_ACCOUNT] = until
         self._save_state()
 
-    def _unmute_self(self, gid: str) -> None:
-        """机器人自己被解禁:清除时长。
+    def _unmute_self(self, gid: str, self_id: str | None = None) -> None:
+        """机器人自己被解禁:只清掉这个账号,不连累同群的其他账号。
 
         全员禁言还在、或者是管理员手动闭嘴的群,继续保持拦截。
         """
         info = self.muted.get(gid)
         if info is None:
             return
-        info["until"] = None
-        if not info.get("whole") and not info.get("manual"):
-            self.muted.pop(gid, None)
-            self.blocked_count.pop(gid, None)
+        accounts = info.get("accounts") or {}
+        if self_id:
+            accounts.pop(str(self_id), None)
+        # 旧状态里"不知道是哪个账号"的占位也一并清掉:既然收到了这个群的
+        # 解禁通知,再拿它去拦所有账号就没道理了
+        accounts.pop(_ANY_ACCOUNT, None)
+        self._drop_if_empty(gid, info)
         self._save_state()
 
-    def _set_whole_mute(
-        self, gid: str, on: bool, self_id: str | None = None
-    ) -> None:
-        """记录 / 清除全员禁言状态。"""
+    def _set_whole_mute(self, gid: str, on: bool, self_id: str | None = None) -> None:
+        """记录 / 清除全员禁言状态(整群生效,不分账号)。"""
         info = self.muted.get(gid)
         if on:
             if info is None:
-                self.muted[gid] = self._entry(None, True, self_id)
-                self._save_state()
-            elif not info.get("whole"):
-                info["whole"] = True
-                if self_id:
-                    info["self_id"] = self_id
-                self._save_state()
+                info = self._entry()
+                self.muted[gid] = info
+            info["whole"] = True
+            if self_id:
+                info["whole_owner"] = str(self_id)
+            self._save_state()
         else:
             if info is None or not info.get("whole"):
                 return
             info["whole"] = False
-            if info.get("until") is None and not info.get("manual"):
-                self.muted.pop(gid, None)
-                self.blocked_count.pop(gid, None)
+            info["whole_owner"] = None
+            self._drop_if_empty(gid, info)
             self._save_state()
+
+    def _drop_whole_mute_if_disabled(self) -> None:
+        """配置里关掉了全员禁言拦截时,把历史遗留的全员禁言条目清掉。
+
+        否则"关掉开关"只对新通知生效,之前记下的拦截会一直留着、重启也
+        带得回来,和配置的意图正好相反。
+        """
+        if self._cfg("block_on_whole_group_mute", True):
+            return
+        dropped = [gid for gid, info in self.muted.items() if info.get("whole")]
+        if not dropped:
+            return
+        for gid in dropped:
+            info = self.muted[gid]
+            info["whole"] = False
+            info["whole_owner"] = None
+            self._drop_if_empty(gid, info)
+        self._save_state()
+        logger.info(
+            "被禁言了我闭嘴: 全员禁言拦截已关闭, 清掉 %s 个群的历史全员禁言状态",
+            len(dropped),
+        )
 
     @staticmethod
     def _parse_duration(value: Any) -> int:
@@ -348,6 +424,7 @@ class ShutUpWhenMuted(Star):
     # ------------------------------------------------------------ 生命周期
     async def initialize(self) -> None:
         """插件被启用时调用:安装发送拦截,启动定时检查任务。"""
+        self._drop_whole_mute_if_disabled()
         self._install_patch()
         self._check_platform()
         if self._expire_task is None or self._expire_task.done():
@@ -404,7 +481,7 @@ class ShutUpWhenMuted(Star):
         if getattr(AiocqhttpMessageEvent, "_shutup_send_patched", False):
             AiocqhttpMessageEvent._shutup_muted_groups = self.muted
             AiocqhttpMessageEvent._shutup_blocked_count = self.blocked_count
-            AiocqhttpMessageEvent._shutup_expire_hook = self._expire_once
+            AiocqhttpMessageEvent._shutup_is_blocked = self._is_blocked
             AiocqhttpMessageEvent._shutup_log_blocked = bool(
                 self._cfg("log_blocked_sends", True)
             )
@@ -441,25 +518,10 @@ class ShutUpWhenMuted(Star):
                 sender_self_id = None
             block = False
             if is_group and gid and muted:
-                info = muted.get(gid)
-                if info is not None:
-                    until = info.get("until")
-                    whole = bool(info.get("whole"))
-                    owner = info.get("self_id")
-                    # 多账号:被禁言的是别的机器人账号,这个账号照常发
-                    other_account = bool(
-                        owner and sender_self_id and str(owner) != sender_self_id
-                    )
-                    if not other_account:
-                        if whole or until is None or time.time() < until:
-                            block = True
-                        else:
-                            # 已到期:交给插件统一清理(会落盘并写日志)
-                            hook = getattr(cls, "_shutup_expire_hook", None)
-                            if callable(hook):
-                                hook()
-                            else:
-                                muted.pop(gid, None)
+                # 交给插件统一判断:多账号隔离、到期即时放行、清理落盘都在里面
+                checker = getattr(cls, "_shutup_is_blocked", None)
+                if callable(checker):
+                    block = bool(checker(gid, sender_self_id))
             if block:
                 counter = getattr(cls, "_shutup_blocked_count", None)
                 if isinstance(counter, dict):
@@ -486,7 +548,7 @@ class ShutUpWhenMuted(Star):
         AiocqhttpMessageEvent._shutup_send_patched = True
         AiocqhttpMessageEvent._shutup_muted_groups = self.muted
         AiocqhttpMessageEvent._shutup_blocked_count = self.blocked_count
-        AiocqhttpMessageEvent._shutup_expire_hook = self._expire_once
+        AiocqhttpMessageEvent._shutup_is_blocked = self._is_blocked
         AiocqhttpMessageEvent._shutup_log_blocked = bool(
             self._cfg("log_blocked_sends", True)
         )
@@ -513,7 +575,7 @@ class ShutUpWhenMuted(Star):
             "_shutup_orig_send_message",
             "_shutup_log_blocked",
             "_shutup_blocked_count",
-            "_shutup_expire_hook",
+            "_shutup_is_blocked",
         ):
             try:
                 delattr(AiocqhttpMessageEvent, attr)
@@ -574,13 +636,13 @@ class ShutUpWhenMuted(Star):
                         duration,
                     )
             else:
-                self._unmute_self(group_id)
+                self._unmute_self(group_id, self_id=self_id)
                 logger.info("被禁言了我闭嘴: 群 %s 已解禁, 恢复消息发送", group_id)
         elif user_id == "0":
             # 全员禁言 / 解除全员禁言(OneBot 约定 user_id 为 0)
-            if not self._cfg("block_on_whole_group_mute", True):
-                return
             if sub_type == "ban":
+                if not self._cfg("block_on_whole_group_mute", True):
+                    return
                 # 群管理员 / 群主不受全员禁言影响,先查一下机器人的身份
                 if await self._bot_is_group_admin(event, group_id, self_id):
                     logger.info(
@@ -595,6 +657,8 @@ class ShutUpWhenMuted(Star):
                     group_id,
                 )
             else:
+                # 解除通知一定要处理:否则中途把配置开关关掉后,之前记下的
+                # 全员禁言拦截就再没人清了,那个群会被一直拦着
                 self._set_whole_mute(group_id, False, self_id=self_id)
                 logger.info(
                     "被禁言了我闭嘴: 群 %s 解除全员禁言, 恢复消息发送", group_id
@@ -676,15 +740,16 @@ class ShutUpWhenMuted(Star):
         lines = ["当前正在拦截消息发送的群:"]
         now = time.time()
         for gid, info in sorted(self.muted.items()):
-            until = info.get("until")
-            whole = bool(info.get("whole"))
             desc = []
             if info.get("manual"):
                 desc.append("手动闭嘴中")
-            if whole:
+            if info.get("whole"):
                 desc.append("全员禁言中")
-            if until is not None:
-                remain = max(0, int(until - now))
+            untils = [
+                u for u in (info.get("accounts") or {}).values() if u is not None
+            ]
+            if untils:
+                remain = max(0, int(min(untils) - now))
                 desc.append(f"剩余约 {self._fmt_remaining(remain)}")
             if not desc:
                 desc.append("时长未知,等待解禁通知或手动解除")
@@ -737,24 +802,26 @@ class ShutUpWhenMuted(Star):
         now = time.time()
         expired = []
         changed = False
-        for gid, info in self.muted.items():
-            until = info.get("until")
-            if until is not None and now >= until:
-                if info.get("whole"):
-                    # 个人禁言到期,但全员禁言还在,继续拦
-                    info["until"] = None
+        for gid, info in list(self.muted.items()):
+            accounts = info.get("accounts") or {}
+            local_changed = False
+            for acc, until in list(accounts.items()):
+                if until is not None and now >= until:
+                    accounts.pop(acc, None)
+                    local_changed = True
                     changed = True
-                elif info.get("manual"):
-                    # 手动闭嘴的群不自动恢复,等 /闭嘴解除
-                    info["until"] = None
-                    changed = True
-                else:
-                    expired.append(gid)
-        for gid in expired:
-            self.muted.pop(gid, None)
-            self.blocked_count.pop(gid, None)
-            logger.info("被禁言了我闭嘴: 群 %s 禁言时长已到, 自动恢复消息发送", gid)
-        if expired or changed:
+                    logger.info(
+                        "被禁言了我闭嘴: 群 %s 的账号 %s 禁言时长已到,"
+                        " 自动恢复消息发送",
+                        gid,
+                        acc,
+                    )
+            if local_changed:
+                # 个人禁言到期后,如果全员禁言 / 手动闭嘴还在,条目继续保留
+                self._drop_if_empty(gid, info)
+            if gid not in self.muted:
+                expired.append(gid)
+        if changed:
             self._save_state()
         return expired
 
@@ -803,63 +870,55 @@ class ShutUpWhenMuted(Star):
         for gid, info in list(self.muted.items()):
             if not gid.isdigit():
                 continue
-            self_id = info.get("self_id")
-            if not (self_id and str(self_id).isdigit()):
-                continue
+            if info.get("manual"):
+                continue  # 手动闭嘴的群保持闭嘴,自检不动它
             bot = self._bot_for(gid)
             if bot is None:
                 continue
-            try:
-                member = await bot.call_action(
-                    "get_group_member_info",
-                    group_id=int(gid),
-                    user_id=int(self_id),
-                )
-            except Exception:
-                continue  # 查不到就保持现状
-            if not isinstance(member, dict):
-                continue
 
-            # 全员禁言:机器人是管理员/群主时本来就能发言,直接撤销拦截。
-            # 这个群已经处理完了,后面的个人禁言判断不再重复计入 changed。
-            if info.get("whole") and member.get("role") in ("admin", "owner"):
-                info["whole"] = False
-                if info.get("until") is None and not info.get("manual"):
-                    self.muted.pop(gid, None)
-                    self.blocked_count.pop(gid, None)
-                changed.append(gid)
-                continue
-
-            raw_ts = member.get("shut_up_timestamp")
-            if raw_ts is None:
-                continue  # 协议端没返回这个字段,不做判断
-            try:
-                until = float(raw_ts)
-            except (TypeError, ValueError):
-                continue
-
-            if until > now:
-                # 确实还在禁言中:顺便把截止时间校准成协议端的值。
-                # 协议端给的是整数秒、本地存的是浮点,差不到 1 秒就当没变,
-                # 否则每轮自检都会误报"修正了一个群"。
-                if info.get("manual"):
-                    continue
-                stored = info.get("until")
-                if stored is None or abs(float(stored) - until) >= 1:
-                    info["until"] = until
-                    changed.append(gid)
-            else:
-                # 已经不在禁言中:清掉"个人被禁言"这部分
-                if info.get("manual"):
-                    continue  # 手动闭嘴的群保持闭嘴
-                if info.get("whole"):
-                    # 个人禁言到期了,但全员禁言还在,继续拦
-                    if info.get("until") is not None:
-                        info["until"] = None
+            # 全员禁言:机器人是管理员/群主时本来就能发言,撤销这个拦截。
+            if info.get("whole"):
+                owner = info.get("whole_owner")
+                if owner and str(owner).isdigit():
+                    member = await self._member_info(bot, gid, str(owner))
+                    if member is not None and member.get("role") in ("admin", "owner"):
+                        info["whole"] = False
+                        info["whole_owner"] = None
+                        self._drop_if_empty(gid, info)
                         changed.append(gid)
+                # 机器人不是管理员(或查不到):全员禁言继续拦
+                continue
+
+            # 个人禁言:逐个账号向协议端核对,该清的清、该校准的校准
+            accounts = info.get("accounts") or {}
+            local_changed = False
+            for acc in list(accounts.keys()):
+                if not acc.isdigit():
+                    continue  # 查不出账号(旧状态占位):保持现状
+                member = await self._member_info(bot, gid, acc)
+                if member is None:
+                    continue  # 查不到就保持现状
+                raw_ts = member.get("shut_up_timestamp")
+                if raw_ts is None:
+                    continue  # 协议端没返回这个字段,不做判断
+                try:
+                    until = float(raw_ts)
+                except (TypeError, ValueError):
                     continue
-                self.muted.pop(gid, None)
-                self.blocked_count.pop(gid, None)
+                if until > now:
+                    # 确实还在禁言中:把截止时间校准成协议端的值。
+                    # 协议端给的是整数秒、本地存的是浮点,差不到 1 秒就当没变,
+                    # 否则每轮自检都会误报"修正了一个群"。
+                    stored = accounts.get(acc)
+                    if stored is None or abs(float(stored) - until) >= 1:
+                        accounts[acc] = until
+                        local_changed = True
+                else:
+                    # 协议端说这个账号已经不在禁言中
+                    accounts.pop(acc, None)
+                    local_changed = True
+            if local_changed:
+                self._drop_if_empty(gid, info)
                 changed.append(gid)
 
         if changed:
@@ -870,6 +929,19 @@ class ShutUpWhenMuted(Star):
                 ", ".join(changed),
             )
         return changed
+
+    @staticmethod
+    async def _member_info(bot: Any, gid: str, uid: str) -> dict | None:
+        """查询群成员的资料(自检用),失败或返回异常时给 None。"""
+        try:
+            info = await bot.call_action(
+                "get_group_member_info",
+                group_id=int(gid),
+                user_id=int(uid),
+            )
+        except Exception:
+            return None
+        return info if isinstance(info, dict) else None
 
     async def _expire_loop(self) -> None:
         """后台周期任务:检查禁言时长是否到期,并定期做一次自检纠偏。"""

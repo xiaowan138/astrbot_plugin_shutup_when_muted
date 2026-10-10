@@ -221,7 +221,7 @@ _PATCH_ATTRS = (
     "_shutup_orig_send_message",
     "_shutup_log_blocked",
     "_shutup_blocked_count",
-    "_shutup_expire_hook",
+    "_shutup_is_blocked",
 )
 
 
@@ -391,7 +391,7 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
             await self._notice(
                 h.plugin, _ban_notice("111", "999", "999", duration=duration)
             )
-            self.assertIsNone(h.plugin.muted["111"]["until"])
+            self.assertIsNone(h.plugin.muted["111"]["accounts"]["999"])
             await self._send(session_id="111")
             self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
             FakeAiocqhttpMessageEvent.sent = []
@@ -401,7 +401,7 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=2))
         self.assertIn("111", h.plugin.muted)
         # 把到期时间拨到过去,模拟时长走完
-        h.plugin.muted["111"]["until"] = time.time() - 1
+        h.plugin.muted["111"]["accounts"]["999"] = time.time() - 1
         expired = h.plugin._expire_once()
         self.assertEqual(expired, ["111"])
         self.assertNotIn("111", h.plugin.muted)
@@ -412,7 +412,7 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         # 到期后即使后台 30 秒循环还没跑,发送时也应即时放行
         h = await self._install()
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
-        h.plugin.muted["111"]["until"] = time.time() - 1
+        h.plugin.muted["111"]["accounts"]["999"] = time.time() - 1
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
         self.assertNotIn("111", h.plugin.muted)
@@ -421,7 +421,7 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         # 发送路径上发现过期时,要走 _expire_once(会落盘),而不是只改内存
         h = await self._install()
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
-        h.plugin.muted["111"]["until"] = time.time() - 1
+        h.plugin.muted["111"]["accounts"]["999"] = time.time() - 1
         h.plugin._save_state()
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
@@ -435,7 +435,7 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         await self._notice(h.plugin, _ban_notice("111", "0", "999", duration=-1))
         info = h.plugin.muted["111"]
         self.assertTrue(info["whole"])
-        self.assertIsNone(info["until"])
+        self.assertEqual(info["accounts"], {})
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
         # 禁言期间的群消息也不触发默认 LLM
@@ -501,14 +501,14 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
         await self._notice(h.plugin, _ban_notice("111", "0", "999", duration=-1))
         info = h.plugin.muted["111"]
-        self.assertIsNotNone(info["until"])
+        self.assertIsNotNone(info["accounts"]["999"])
         self.assertTrue(info["whole"])
         # 个人解禁:全员禁言还在,继续拦
         await self._notice(
             h.plugin, _ban_notice("111", "999", "999", duration=0, sub_type="lift_ban")
         )
         self.assertTrue(h.plugin.muted["111"]["whole"])
-        self.assertIsNone(h.plugin.muted["111"]["until"])
+        self.assertNotIn("999", h.plugin.muted["111"]["accounts"])
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
         # 解除全员禁言:彻底恢复
@@ -524,11 +524,11 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         h = await self._install()
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
         await self._notice(h.plugin, _ban_notice("111", "0", "999", duration=-1))
-        h.plugin.muted["111"]["until"] = time.time() - 1
+        h.plugin.muted["111"]["accounts"]["999"] = time.time() - 1
         expired = h.plugin._expire_once()
         self.assertEqual(expired, [])
         self.assertTrue(h.plugin.muted["111"]["whole"])
-        self.assertIsNone(h.plugin.muted["111"]["until"])
+        self.assertEqual(h.plugin.muted["111"]["accounts"], {})
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
 
@@ -566,6 +566,72 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         await h.plugin.on_group_message(ev_own)
         self.assertTrue(ev_own.call_llm)
 
+    async def test_whole_group_mute_blocks_other_account_too(self):
+        # 全员禁言是"整群都不能说话",别的机器人账号同样发不出去 -> 也要拦
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "0", "999", duration=-1))
+        await self._send(session_id="111", event={"self_id": 888})
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
+        # 该群消息也不触发别的账号的默认 LLM 回复
+        ev_other = FakeEvent(group_id="111", self_id="888")
+        await h.plugin.on_group_message(ev_other)
+        self.assertTrue(ev_other.call_llm)
+
+    async def test_whole_group_lift_notice_clears_even_if_config_off(self):
+        # 中途把全员禁言拦截关掉,解除通知仍然要能把历史拦截清掉
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "0", "999", duration=-1))
+        self.assertIn("111", h.plugin.muted)
+        h.plugin.config["block_on_whole_group_mute"] = False
+        await self._notice(
+            h.plugin, _ban_notice("111", "0", "999", duration=0, sub_type="lift_ban")
+        )
+        self.assertNotIn("111", h.plugin.muted)
+        await self._send(session_id="111")
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
+
+    async def test_disabled_whole_mute_dropped_on_startup(self):
+        # 上次留下了全员禁言状态,这次配置里关掉了 -> 启动时清掉,不再拦
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "0", "999", duration=-1))
+        self.assertTrue(h.plugin.muted["111"]["whole"])
+
+        h2 = _PluginHarness({"block_on_whole_group_mute": False}, data_dir=h.data_dir)
+        await h2.plugin.initialize()
+        self.assertNotIn("111", h2.plugin.muted)
+        await self._send(session_id="111", event={"self_id": 999})
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
+
+    async def test_two_accounts_muted_in_same_group_isolated(self):
+        # 同一个群里两个机器人账号都被禁言:各记各的,互不覆盖
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
+        await self._notice(h.plugin, _ban_notice("111", "888", "888", duration=60))
+        self.assertEqual(set(h.plugin.muted["111"]["accounts"]), {"999", "888"})
+
+        # 两个账号发言都被拦
+        await self._send(session_id="111", event={"self_id": 999})
+        await self._send(session_id="111", event={"self_id": 888})
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
+
+        # 999 解禁:只恢复 999,888 仍被拦
+        await self._notice(
+            h.plugin,
+            _ban_notice("111", "999", "999", duration=0, sub_type="lift_ban"),
+        )
+        self.assertNotIn("999", h.plugin.muted["111"]["accounts"])
+        self.assertIn("888", h.plugin.muted["111"]["accounts"])
+        await self._send(session_id="111", event={"self_id": 999})
+        await self._send(session_id="111", event={"self_id": 888})
+        self.assertEqual(FakeAiocqhttpMessageEvent.sent, [(True, "111")])
+
+    async def test_two_accounts_persist_across_restart(self):
+        h = await self._install()
+        await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=3600))
+        await self._notice(h.plugin, _ban_notice("111", "888", "888", duration=3600))
+        h2 = _PluginHarness(data_dir=h.data_dir)
+        self.assertEqual(set(h2.plugin.muted["111"]["accounts"]), {"999", "888"})
+
     # ------------------------------------------------------- 自检纠偏
     async def test_selfcheck_clears_stale_entry(self):
         # 时长未知 + 错过解禁通知 -> 自检发现协议端说没在禁言,清掉
@@ -588,14 +654,16 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         h.plugin._bots["111"] = FakeBot(shut_up_timestamp=future)
         changed = await h.plugin._self_check()
         self.assertEqual(changed, ["111"])
-        self.assertAlmostEqual(h.plugin.muted["111"]["until"], future, places=3)
+        self.assertAlmostEqual(
+            h.plugin.muted["111"]["accounts"]["999"], future, places=3
+        )
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
 
     async def test_selfcheck_no_change_when_until_already_correct(self):
         h = await self._install()
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=300))
-        until = h.plugin.muted["111"]["until"]
+        until = h.plugin.muted["111"]["accounts"]["999"]
         h.plugin._bots["111"] = FakeBot(shut_up_timestamp=int(until))
         changed = await h.plugin._self_check()
         self.assertEqual(changed, [])
@@ -698,11 +766,17 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         h.plugin._load_state()
         # 333 已过期,加载即清理
         self.assertEqual(set(h.plugin.muted), {"111", "222"})
-        self.assertAlmostEqual(h.plugin.muted["111"]["until"], old["111"], places=3)
-        self.assertIsNone(h.plugin.muted["222"]["until"])
+        self.assertAlmostEqual(
+            h.plugin.muted["111"]["accounts"][main._ANY_ACCOUNT],
+            old["111"],
+            places=3,
+        )
+        self.assertIsNone(h.plugin.muted["222"]["accounts"][main._ANY_ACCOUNT])
         self.assertFalse(h.plugin.muted["222"]["whole"])
 
-    async def test_load_new_format(self):
+    async def test_load_v12_single_slot_format(self):
+        # v1.1 / v1.2 的文件一个群只有一个槽位(until + self_id),
+        # 读取时升级成 accounts 映射
         h = _PluginHarness()
         data = {
             "111": {
@@ -716,8 +790,30 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         h.state_file.write_text(json.dumps(data), encoding="utf-8")
         h.plugin._load_state()
         self.assertEqual(set(h.plugin.muted), {"111", "222"})
-        self.assertEqual(h.plugin.muted["111"]["self_id"], "999")
+        self.assertEqual(h.plugin.muted["111"]["whole_owner"], "999")
+        self.assertAlmostEqual(
+            h.plugin.muted["111"]["accounts"]["999"],
+            data["111"]["until"],
+            places=3,
+        )
         self.assertTrue(h.plugin.muted["222"]["whole"])
+
+    async def test_load_v13_accounts_format(self):
+        # v1.3 的文件一个群可以记多个账号,读取时原样保留
+        h = _PluginHarness()
+        data = {
+            "111": {
+                "whole": False,
+                "whole_owner": None,
+                "manual": False,
+                "accounts": {"999": time.time() + 3600, "888": None},
+            }
+        }
+        h.state_file.write_text(json.dumps(data), encoding="utf-8")
+        h.plugin._load_state()
+        accounts = h.plugin.muted["111"]["accounts"]
+        self.assertEqual(set(accounts), {"999", "888"})
+        self.assertIsNone(accounts["888"])
 
     async def test_load_tolerates_v11_format(self):
         # v1.1 的文件没有 self_id / manual 字段,读取时补默认值
@@ -726,14 +822,15 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         h.state_file.write_text(json.dumps(data), encoding="utf-8")
         h.plugin._load_state()
         info = h.plugin.muted["111"]
-        self.assertIsNone(info["self_id"])
+        self.assertIn(main._ANY_ACCOUNT, info["accounts"])
+        self.assertIsNone(info["whole_owner"])
         self.assertFalse(info["manual"])
 
     async def test_load_purges_expired_entry(self):
         h = await self._install()
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=3600))
         # 停机期间禁言早已到期:重启后不应继续拦截
-        h.plugin.muted["111"]["until"] = time.time() - 100
+        h.plugin.muted["111"]["accounts"]["999"] = time.time() - 100
         h.plugin._save_state()
         h2 = _PluginHarness(data_dir=h.data_dir)
         self.assertNotIn("111", h2.plugin.muted)
@@ -821,7 +918,7 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
             results.append(r)
         self.assertIn("已手动闭嘴", results[0].text)
         self.assertTrue(h.plugin.muted["111"]["manual"])
-        self.assertIsNone(h.plugin.muted["111"]["until"])
+        self.assertEqual(h.plugin.muted["111"]["accounts"], {})
         await self._send(session_id="111")
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
         # 手动闭嘴的群,消息也不触发默认 LLM
@@ -857,14 +954,15 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FakeAiocqhttpMessageEvent.sent, [])
 
     async def test_expire_keeps_manual_mute(self):
-        # 手动闭嘴的条目即使被写了 until,到期也不自动恢复
+        # 手动闭嘴的条目里即使残留了已过期的个人禁言记录,整群也不自动恢复
         h = await self._install()
         async for _ in h.plugin.mute_cmd(FakeEvent(), "111"):
             pass
-        h.plugin.muted["111"]["until"] = time.time() - 1
+        h.plugin.muted["111"]["accounts"]["999"] = time.time() - 1
         expired = h.plugin._expire_once()
         self.assertEqual(expired, [])
         self.assertIn("111", h.plugin.muted)
+        self.assertEqual(h.plugin.muted["111"]["accounts"], {})
 
     async def test_missing_group_id_hint(self):
         h = await self._install()
@@ -933,7 +1031,9 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         raw["duration"] = "120"  # 个别协议端可能把时长传成字符串
         await self._notice(h.plugin, raw)
         self.assertIn("111", h.plugin.muted)
-        self.assertGreater(h.plugin.muted["111"]["until"], time.time() + 100)
+        self.assertGreater(
+            h.plugin.muted["111"]["accounts"]["999"], time.time() + 100
+        )
 
     async def test_duration_as_float_string(self):
         h = await self._install()
@@ -941,14 +1041,16 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         raw["duration"] = "120.5"
         await self._notice(h.plugin, raw)
         self.assertIn("111", h.plugin.muted)
-        self.assertGreater(h.plugin.muted["111"]["until"], time.time() + 100)
+        self.assertGreater(
+            h.plugin.muted["111"]["accounts"]["999"], time.time() + 100
+        )
 
     async def test_reban_updates_duration(self):
         h = await self._install()
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=60))
-        first = h.plugin.muted["111"]["until"]
+        first = h.plugin.muted["111"]["accounts"]["999"]
         await self._notice(h.plugin, _ban_notice("111", "999", "999", duration=600))
-        self.assertGreater(h.plugin.muted["111"]["until"], first)
+        self.assertGreater(h.plugin.muted["111"]["accounts"]["999"], first)
 
     async def test_non_onebot_events_ignored(self):
         h = await self._install()
@@ -971,7 +1073,7 @@ class TestShutUpWhenMuted(unittest.IsolatedAsyncioTestCase):
         ev = FakeEvent(group_id="111", self_id="999", raw=raw)
         await h.plugin.on_group_ban_notice(ev)
         self.assertIn("111", h.plugin.muted)
-        self.assertEqual(h.plugin.muted["111"]["self_id"], "999")
+        self.assertIn("999", h.plugin.muted["111"]["accounts"])
 
     async def test_fmt_remaining(self):
         f = ShutUpWhenMuted._fmt_remaining
